@@ -8,8 +8,21 @@ const logger = require('../utils/logger');
 const { emitToBatchRoom } = require('../services/socketService');
 const activityService = require('../services/activityService');
 const QRCode = require('qrcode');
+const { calculateUpdateHash } = require('../utils/cryptography');
 
 const escapeRegex = (value) => String(value).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+
+const CSV_FORMULA_PREFIX = /^[=+\-@]/;
+
+const escapeCsvCell = (value) => {
+    if (value == null) return '""';
+    const str = String(value);
+    const escaped = str.replace(/"/g, '""');
+    if (CSV_FORMULA_PREFIX.test(escaped)) {
+        return `"\t${escaped}"`;
+    }
+    return `"${escaped}"`;
+};
 
 const buildSafeSearchFilter = (value) => {
     if (typeof value !== 'string') {
@@ -76,6 +89,15 @@ exports.createBatch = async (req, res) => {
         const batchId = await generateBatchId(session);
         const qrCode = await generateQRCode(batchId);
 
+        const initialUpdate = {
+            stage: "farmer",
+            actor: validatedData.farmerName || req.user.name,
+            location: validatedData.origin,
+            timestamp: validatedData.harvestDate,
+            notes: validatedData.description || "Initial harvest recorded"
+        };
+        initialUpdate.hash = calculateUpdateHash(initialUpdate, '');
+
         const batch = await Batch.create([{
             batchId,
             farmerId: req.user.farmerId || req.user.id,
@@ -96,13 +118,7 @@ exports.createBatch = async (req, res) => {
             crossChain: {
                 status: 'not_required'
             },
-            updates: [{
-                stage: "farmer",
-                actor: validatedData.farmerName || req.user.name,
-                location: validatedData.origin,
-                timestamp: validatedData.harvestDate,
-                notes: validatedData.description || "Initial harvest recorded"
-            }]
+            updates: [initialUpdate]
         }], { session });
 
         // Commit the transaction
@@ -213,6 +229,17 @@ exports.updateBatch = async (req, res) => {
 
         const normalizedStage = validatedData.stage.toLowerCase();
 
+        const previousBatch = await Batch.findOne({ batchId });
+        if (!previousBatch) {
+            return res.status(404).json(
+                apiResponse.notFoundResponse('Batch', `ID: ${batchId}`)
+            );
+        }
+
+        const previousHash = previousBatch.updates && previousBatch.updates.length > 0
+            ? previousBatch.updates[previousBatch.updates.length - 1].hash || ''
+            : '';
+
         const updateEntry = {
             stage: normalizedStage,
             actor: validatedData.actorName || req.user.name,
@@ -220,6 +247,7 @@ exports.updateBatch = async (req, res) => {
             timestamp: validatedData.timestamp || new Date().toISOString(),
             notes: validatedData.notes
         };
+        updateEntry.hash = calculateUpdateHash(updateEntry, previousHash);
 
         const setFields = { currentStage: normalizedStage };
         if (validatedData.quantity) setFields.quantity = validatedData.quantity;
@@ -614,6 +642,14 @@ exports.exportBatch = async (req, res) => {
         if (format === 'csv') {
             const csvData = [
                 'Field,Value',
+                `Batch ID,${escapeCsvCell(batch.batchId)}`,
+                `Crop Type,${escapeCsvCell(batch.cropType)}`,
+                `Quantity,${escapeCsvCell(batch.quantity + ' kg')}`,
+                `Harvest Date,${escapeCsvCell(batch.harvestDate || 'N/A')}`,
+                `Origin,${escapeCsvCell(batch.origin)}`,
+                `Farmer,${escapeCsvCell(batch.farmerName)}`,
+                `Current Stage,${escapeCsvCell(batch.currentStage)}`,
+                `Status,${escapeCsvCell(batch.isSpoiled ? 'Spoiled' : 'Active')}`,
                 `Batch ID,${sanitizeCSV(batch.batchId)}`,
                 `Crop Type,${sanitizeCSV(batch.cropType)}`,
                 `Quantity,${batch.quantity} kg`,
@@ -629,6 +665,13 @@ exports.exportBatch = async (req, res) => {
                 csvData.push('Timeline');
                 csvData.push('Stage,Actor,Location,Date,Notes');
                 batch.updates.forEach(u => {
+                    csvData.push([
+                        escapeCsvCell(u.stage),
+                        escapeCsvCell(u.actor),
+                        escapeCsvCell(u.location),
+                        escapeCsvCell(u.timestamp),
+                        escapeCsvCell(u.notes),
+                    ].join(','));
                     const stage = sanitizeCSV(u.stage || '').replace(/"/g, '""');
                     const actor = sanitizeCSV(u.actor || '').replace(/"/g, '""');
                     const location = sanitizeCSV(u.location || '').replace(/"/g, '""');
